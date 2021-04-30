@@ -1,0 +1,221 @@
+---
+title: "PMLproject"
+author: "Daisuke Ohnuki"
+date: "4/30/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+## Loading required packages
+library(caret)
+library(dplyr)
+library(corrplot)
+## Reading the data
+train_set <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+```
+
+To validate our predictions and improve our model, we use 20% from the training set as a validation set.
+
+```{r}
+## Creating training and validation set
+inTrain <- createDataPartition(y = train_set$classe, p = .8, list = FALSE)
+training <- train_set[inTrain,]
+validation <- train_set[-inTrain,]
+dim(training)
+dim(validation)
+```
+
+### The "num_window" variable
+
+```{r}
+str(training[,1:8])
+```
+
+At some point, looking for good predictors for our model, we come across the first columns in the training set, which are not sensory data (starting with "roll_belt"), but information about the dataset itself. We can remove the first 6 columns of the training set. But what about the *num_window* variable? It's an integer, without missing data and NZV doesn't apply. Including it into our model, however, could be misleading. Here's why:
+
+```{r plot1}
+qplot(seq_along(training$num_window), num_window, color = classe, data = training)
+summary(training$num_window)
+```
+
+It counts the number of (I assume time-) windows per classe (our outcome variable), but more importantly, it never uses the same numbers to do so, making each group unique.
+
+```{r}
+df_A <- training$num_window[training$classe == "A"]
+df_B <- training$num_window[training$classe == "B"]
+df_C <- training$num_window[training$classe == "C"]
+df_D <- training$num_window[training$classe == "D"]
+df_E <- training$num_window[training$classe == "E"]
+intersect(df_A, c(df_B, df_C, df_D, df_E))
+```
+
+A random forest model picks that up and gives (near) perfect prediction. To shorten processing time, I change the default from bootstrapping 25 times to 5 fold cross validation.
+
+```{r, cache=TRUE, warning=FALSE}
+set.seed(1989)
+## Setting control parameters
+control_num_window <- trainControl(method = "cv", number = 5, verboseIter = FALSE)
+## Training the model
+model_num_window <- train(classe ~ num_window, data = training, method = "rf",                            trControl = control_num_window)
+model_num_window$finalModel
+## Predicting on validation set
+predm_v<-predict(model_num_window, validation)
+confusionMatrix(table(predm_v, validation$classe))$overall[1]
+```
+
+Any random forrest model containing the *num_window* variable would automatically have a high accuracy. If your goal is just to predict the test cases, you wouldn't need any other variable. Actually, every added variable should (even slightly) reduce accuracy. Since the 20 test cases are part of the same dataset and contain the telling *num_window* variable. **!SPOILER ALERT!**
+
+```{r}
+## Predicting the test cases
+pred_test <- predict(model_num_window, testing)
+pred_test
+```
+
+But the out of sample error of our model would be turning from hero to zero with an independed dataset, if not recorded in the very same way. The model works on our data, but yields no practical relevance. 
+
+### Finding good sensory predictors
+
+The true goal of our project is to find out if you can predict accurately how an excercise was done, based on sensory data. So we get rid of the first seven rows of the training set, including the *num_window* column.
+
+```{r}
+training <- training[,-(1:7)]
+```
+
+Next we check for missing data in the training set, create a training set without, and check if we can impute missing data when occuring.
+
+```{r}
+## Creating a data frame of all columns with missing data
+train_na <- training[, colSums(is.na(training)) > 0]
+dim(train_na)
+## Reducing the training set to columns without missing data
+training <- training[, colSums(is.na(training)) == 0]
+dim(training)
+## Calculating the percentage of missing values 
+na_percent <- sapply(train_na, function(x) mean(is.na(x)))
+table(na_percent)
+```
+
+All columns with missing data are missing more than 97% of it. So we leave them be and move on to filter out variables with near zero variance, that wouldn't help our model.
+
+```{r}
+nzv <- nearZeroVar(training)
+training <- training[, -nzv]
+dim(training)
+```
+
+That leaves us with 52 variables we can predict with and our outcome variable *classe*. 
+
+```{r}
+validation <- select(validation, names(training))
+dim(validation)
+```
+
+### Fitting Models
+
+Random forrest models seem to be very good at this kind of prediction. Let's find out. We reduce the number of folds in cross validation to 3 and also have an eye on the time needed for training the model.
+
+```{r, cache=TRUE}
+## Setting resampling to 3 fold cross validation
+control_rf <- trainControl(method = "cv", number = 3, verboseIter = FALSE)
+set.seed(242424)
+## Starting time
+start <- Sys.time()
+## Training the random forrest model
+model_rf <- train(classe ~ ., data = training, method = "rf", trControl = control_rf)
+## Stopping time
+finish <- Sys.time()
+## Calculating time needed for training model
+time_rf <- finish - start
+## Showing final model
+model_rf$finalModel
+## Showing time needed for training
+time_rf
+## Predicting accuracy for validation set
+predictmrf <- predict(model_rf, validation)
+confusionMatrix(table(predictmrf, validation$classe))$overall[1]
+```
+
+In comparison, let's see how a gradient boosting model works with our data.
+
+```{r, cache=TRUE}
+set.seed(262626)
+## Starting time
+start <- Sys.time()
+## Training the boosting model
+model_boo <- train(classe ~ ., data = training, method = "gbm", verbose = F, trControl = control_rf)
+## Stopping time
+finish <- Sys.time()
+## Calculating time needed for training model
+time_boo <- finish - start
+## Showing time needed for training
+time_boo
+## Predicting accuracy for validation set
+predictmb <- predict(model_boo, validation)
+confusionMatrix(table(predictmb, validation$classe))$overall[1]
+```
+
+The random forrest model is more accurate, but needs longer preocessing time. Let's see if we can reduce that time, without losing much of the accuracy.
+
+### Improving the Model
+
+First we can take a look at the variables that are most important for our random forrest model.
+
+```{r}
+imp_rf <- varImp(model_rf, scale = FALSE)
+imp_rf
+```
+
+How much accuracy would we lose reducing the number of variables used to the top 20, and how much faster would it be computed?
+
+```{r, cache=TRUE}
+## Extracting the names for the top 20 variables
+df_imp <- data.frame(imp_rf$importance)
+df_imp$names <- row.names(df_imp)
+## Creating new training and validation set
+train_imp <- select(training, df_imp[order(-df_imp$Overall),][1:20,]$names, classe)
+valid_imp <- select(validation, df_imp[order(-df_imp$Overall),][1:20,]$names, classe)
+## Running the new model
+set.seed(252525)
+## Starting time
+start <- Sys.time()
+## Training model
+model_rf_imp20 <- train(classe ~ ., data=train_imp, method="rf", trControl=control_rf)
+## Stopping time
+finish <- Sys.time()
+## Calculating time needed for training model
+time_rf_imp20 <- finish - start
+## Showing time needed for training
+time_rf_imp20
+## Predicting accuracy for validation set
+predictimp20 <- predict(model_rf_imp20, valid_imp)
+confusionMatrix(table(predictimp20, valid_imp$classe))$overall[1]
+```
+
+We lose a little bit of accuracy, but the model just needs roughly a third of the processing time. About the same time as the boosted model now, but more accurate.
+You could rerun the importance of the variables in the random forrest model again, reducing the number of predictors even further (and losing some accuracy). 
+
+We could also take a look at high correlations among the variables in the model, and might reduce the predictors with principal components analysis.
+
+```{r plot2}
+## Creating correlation matrix without the outcome variable
+cor_matrix <- cor(train_imp[, -21])
+## Creating correlation plot
+corrplot(cor_matrix, method = "square", type = "lower", tl.col = "black", tl.srt = 90)
+```
+
+## Final thoughts
+
+Eventually, building an optimized machine learning model depends on the application of the model. How much accuracy you're willing to give up for interpretability, speed, simplicity and scalability? But we can conclude that a machine learning model could accurately predict how a certain excercise was done with sensory data.
+
+## Prediction (again) of the 20 test cases
+
+This time we will use sensory data to predict the Quiz cases with our last random forrest model.
+
+```{r}
+predict(model_rf_imp20, testing)
+```
